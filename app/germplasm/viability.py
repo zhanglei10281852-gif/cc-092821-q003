@@ -1,14 +1,28 @@
 from __future__ import annotations
 
 import calendar
+import json
 import sqlite3
+import time
 from datetime import date, datetime
 from typing import Any
 
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, ValidationError
+from app.core.security import canonicalize
 from app.germplasm.inventory import InventoryService
 from app.germplasm.repository import GermplasmRepository, record, records
+from app.services.idempotency import (
+    IdempotencyConflictError,
+    IdempotencyRecord,
+    IdempotencyService,
+    diff_fields,
+)
+
+SCHEDULE_SCOPE = "viability.schedule"
+# 并发请求撞上尚未完成的占位记录时的等待上限。
+PENDING_WAIT_SECONDS = 3.0
+PENDING_POLL_INTERVAL = 0.05
 
 
 class ViabilityService:
@@ -35,13 +49,110 @@ class ViabilityService:
         return self.repository.require_protocol(int(cursor.lastrowid))
 
     def schedule_test(self, data: dict[str, Any]) -> dict[str, Any]:
-        replay = self.connection.execute(
-            "SELECT response_json FROM idempotency_records WHERE scope='viability.schedule' AND idempotency_key=?",
-            (data["idempotency_key"],),
-        ).fetchone()
-        if replay:
-            import json
-            return self.repository.test_detail(int(json.loads(replay[0])["test_id"]))
+        """安排活力检测；只有内容（规范化后）完全一致的重试才回放首次结果。
+
+        任一影响检测的字段（检测编号、批次、规程、类型、取样量、计划日期、申请人）不同，
+        返回 409 并带上原任务标识与冲突字段。幂等占位保证并发创建只产生：
+        一个检测任务、一次复检日程状态变化、一条取样意图。
+        """
+        key = str(data["idempotency_key"])
+        payload = canonicalize({k: v for k, v in data.items() if k != "idempotency_key"})
+        idempotency = IdempotencyService(self.connection, self.clock)
+
+        existing = idempotency.get_record(SCHEDULE_SCOPE, key)
+        if existing is not None and existing.completed:
+            if existing.request_snapshot:
+                return self._replay_strict(idempotency, existing, payload, key)
+            return self._replay_legacy(idempotency, existing, payload, key)
+
+        holder = idempotency.reserve(SCHEDULE_SCOPE, key, payload)
+        if holder is None:
+            try:
+                test = self._create_test(data)
+            except Exception:
+                idempotency.release(SCHEDULE_SCOPE, key)
+                raise
+            idempotency.complete(
+                SCHEDULE_SCOPE, key, payload,
+                {"test_id": test["id"], "test_no": test["test_no"]}, 201,
+                resource={
+                    "resource_type": "viability_test",
+                    "test_id": test["id"],
+                    "test_no": test["test_no"],
+                },
+            )
+            test["idempotency"] = {"status": "created", "scope": SCHEDULE_SCOPE, "idempotency_key": key}
+            return test
+
+        # 已有记录：等待并发的首次创建落盘（HTTP 事务本身已串行，这里再兜底一次）。
+        holder = self._await_completion(idempotency, key, holder)
+        if not holder.completed:
+            raise ConflictError("同一幂等键的请求仍在处理中，请稍后重试")
+        return self._replay_strict(idempotency, holder, payload, key)
+
+    def _replay_strict(
+        self, idempotency: IdempotencyService, holder: IdempotencyRecord, payload: dict, key: str
+    ) -> dict[str, Any]:
+        idempotency.lookup(SCHEDULE_SCOPE, key, payload)  # 内容不一致时抛出带冲突字段的 409
+        return self._replayed_detail(holder, key)
+
+    def _replay_legacy(
+        self, idempotency: IdempotencyService, holder: IdempotencyRecord, payload: dict, key: str
+    ) -> dict[str, Any]:
+        """升级前的旧记录没有请求快照：按检测任务实际落库内容逐字段比对，并顺手补严格化。"""
+        test_id = int(holder.response.get("test_id") or 0)
+        if test_id <= 0:
+            raise IdempotencyConflictError(
+                "同一幂等键不能用于内容不同的请求", original_resource=holder.resource or None
+            )
+        row = self.repository.require_test(test_id)
+        original = canonicalize({
+            "test_no": row["test_no"], "lot_id": row["lot_id"], "protocol_id": row["protocol_id"],
+            "test_type": row["test_type"], "sampled_grams": row["sampled_grams"],
+            "scheduled_for": row["scheduled_for"], "requested_by": row["requested_by"],
+        })
+        conflicts = diff_fields(original, payload)
+        resource = {"resource_type": "viability_test", "test_id": test_id, "test_no": row["test_no"]}
+        if conflicts:
+            raise IdempotencyConflictError(
+                "同一幂等键不能用于内容不同的请求", conflicts=conflicts, original_resource=resource
+            )
+        # 内容一致：把旧记录补齐为严格快照，重启后即按规范化指纹判定。
+        idempotency.heal(SCHEDULE_SCOPE, key, payload, resource)
+        healed = idempotency.get_record(SCHEDULE_SCOPE, key) or holder
+        return self._replayed_detail(healed, key)
+
+    def _replayed_detail(self, holder: IdempotencyRecord, key: str) -> dict[str, Any]:
+        test_id = int(holder.resource.get("test_id") or holder.response.get("test_id") or 0)
+        detail = self.repository.test_detail(test_id)
+        detail["idempotency"] = {
+            "status": "replayed", "scope": SCHEDULE_SCOPE, "idempotency_key": key,
+            "record_created_at": holder.created_at,
+        }
+        return detail
+
+    def idempotency_info(self, test_id: int) -> dict[str, Any] | None:
+        """检测任务对应的幂等记录，供检测详情/API 确认请求是首次创建还是安全重放。"""
+        service = IdempotencyService(self.connection, self.clock)
+        record = service.find_by_test_id(test_id, SCHEDULE_SCOPE)
+        return None if record is None else service.describe(record)
+
+    def _await_completion(
+        self, idempotency: IdempotencyService, key: str, holder: IdempotencyRecord
+    ) -> IdempotencyRecord:
+        if holder.completed:
+            return holder
+        deadline = time.monotonic() + PENDING_WAIT_SECONDS
+        current = holder
+        while not current.completed and time.monotonic() < deadline:
+            time.sleep(PENDING_POLL_INTERVAL)
+            refreshed = idempotency.get_record(SCHEDULE_SCOPE, key)
+            if refreshed is None:
+                return current
+            current = refreshed
+        return current
+
+    def _create_test(self, data: dict[str, Any]) -> dict[str, Any]:
         lot = self.repository.require_lot(int(data["lot_id"]))
         protocol = self.repository.require_protocol(int(data["protocol_id"]))
         accession = self.repository.require_accession(int(lot["accession_id"]))
@@ -70,20 +181,30 @@ class ViabilityService:
         except sqlite3.IntegrityError as exc:
             raise ConflictError("检测编号已经存在") from exc
         test_id = int(cursor.lastrowid)
-        import json
-        self.connection.execute(
-            "INSERT INTO idempotency_records(scope,idempotency_key,request_hash,response_json,status_code,created_at) "
-            "VALUES('viability.schedule',?,? ,?,201,?)",
-            (data["idempotency_key"], data["test_no"], json.dumps({"test_id": test_id}), timestamp),
-        )
+        # 仅当存在待通知的复检日程时发生一次状态变化。
         schedule = self.connection.execute(
             "SELECT id FROM retest_schedules WHERE lot_id=? AND status IN ('pending','notified') ORDER BY due_on LIMIT 1",
             (lot["id"],),
         ).fetchone()
-        if schedule:
+        schedule_id = int(schedule[0]) if schedule else None
+        if schedule_id is not None:
             self.connection.execute(
-                "UPDATE retest_schedules SET status='scheduled',updated_at=? WHERE id=?", (timestamp, schedule[0])
+                "UPDATE retest_schedules SET status='scheduled',updated_at=? WHERE id=?", (timestamp, schedule_id)
             )
+        # 取样意图：与检测任务同事务写入，事件键包含任务标识，天然只产生一条。
+        self.connection.execute(
+            "INSERT INTO outbox_events(event_key,event_type,aggregate_type,aggregate_id,payload_json,available_at,"
+            "created_at) VALUES(?,?,?,?,?,?,?)",
+            (
+                f"viability-sample-intent-{test_id}", "viability.sample_intended", "viability_test", str(test_id),
+                json.dumps({
+                    "test_id": test_id, "test_no": data["test_no"], "lot_id": lot["id"],
+                    "sampled_grams": float(data["sampled_grams"]), "scheduled_for": str(data["scheduled_for"]),
+                    "retest_schedule_id": schedule_id, "requested_by": data["requested_by"],
+                }, ensure_ascii=False, sort_keys=True),
+                timestamp, timestamp,
+            ),
+        )
         return self.repository.test_detail(test_id)
 
     def start_test(self, test_id: int, data: dict[str, Any]) -> dict[str, Any]:

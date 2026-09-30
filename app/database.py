@@ -98,7 +98,9 @@ CREATE TABLE IF NOT EXISTS idempotency_records (
     scope TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
     request_hash TEXT NOT NULL,
+    request_json TEXT NOT NULL DEFAULT '{}',
     response_json TEXT NOT NULL,
+    resource_json TEXT NOT NULL DEFAULT '{}',
     status_code INTEGER NOT NULL,
     created_at TEXT NOT NULL,
     PRIMARY KEY(scope,idempotency_key)
@@ -468,10 +470,20 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         raise
 
 
+def _ensure_idempotency_columns(connection: sqlite3.Connection) -> None:
+    # 为既有数据库补齐幂等记录的请求快照与资源定位列（新建库由 SCHEMA 直接包含）。
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(idempotency_records)").fetchall()}
+    if columns and "request_json" not in columns:
+        connection.execute("ALTER TABLE idempotency_records ADD COLUMN request_json TEXT NOT NULL DEFAULT '{}'")
+    if columns and "resource_json" not in columns:
+        connection.execute("ALTER TABLE idempotency_records ADD COLUMN resource_json TEXT NOT NULL DEFAULT '{}'")
+
+
 def init_db() -> None:
     timestamp = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _ensure_idempotency_columns(connection)
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",

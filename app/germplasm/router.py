@@ -226,7 +226,21 @@ def schedule_test(data: TestCreate, principal: Principal = Depends(current_princ
 @router.get("/tests/{test_id}")
 def test_detail(test_id: int, principal: Principal = Depends(current_principal)) -> dict:
     principal.require("viability.read")
-    return _service().repository.test_detail(test_id)
+    service = _service()
+    detail = service.repository.test_detail(test_id)
+    detail["idempotency"] = service.viability.idempotency_info(test_id)
+    return detail
+
+
+@router.get("/tests/{test_id}/idempotency")
+def test_idempotency(test_id: int, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("viability.read")
+    service = _service()
+    service.repository.require_test(test_id)
+    record = service.viability.idempotency_info(test_id)
+    if record is None:
+        return {"test_id": test_id, "record": None}
+    return {"test_id": test_id, "record": record}
 
 
 @router.post("/tests/{test_id}/start")

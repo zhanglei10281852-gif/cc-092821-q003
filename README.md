@@ -53,3 +53,5 @@ python -m app.cli demo
 ## 一致性约定
 
 SQLite 连接启用外键、WAL、忙等待和即时写事务。资源档案、库位、容器摆放、检测任务和发放申请采用版本号防止旧请求覆盖新状态；入库、移库、取样和传感读数使用业务键去重。活力检测保留采用的规程版本和每个重复的观察计数，完成后可依据作物及风险策略生成下一次复检日期。会话令牌只保存摘要，审计记录不保存明文密码或令牌。
+
+安排活力检测（`POST /api/germplasm/tests`）的幂等键只重放规范化后内容完全一致的请求：JSON 字段顺序、日期与 ISO 字符串、整数与等值浮点等表示差异不影响判定。沿用同一幂等键但改动检测编号、批次、规程、类型、取样量、计划日期或申请人，将返回 `409`，响应的 `error.context` 中包含原任务标识（`original_resource.test_id/test_no`）与冲突字段清单（`conflicts[].field/original/conflicting`），且不会产生第二个检测任务、复检日程变化或取样意图。并发的相同请求通过幂等记录占位串行化，只产生一个检测任务、一次复检日程状态变化和一条取样意图（`viability.sample_intended` 发件箱事件）。可通过 `GET /api/germplasm/tests/{id}` 与 `GET /api/germplasm/tests/{id}/idempotency` 查看请求是首次创建还是安全重放；检测任务开始时的实际取样仍按 `viability-sample-{test_id}` 业务键去重。

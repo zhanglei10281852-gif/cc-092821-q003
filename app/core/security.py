@@ -6,6 +6,8 @@ import hmac
 import json
 import secrets
 from dataclasses import dataclass
+from datetime import date, datetime, timezone
+from enum import Enum
 from typing import Any
 
 from app.core.errors import ValidationError
@@ -69,9 +71,59 @@ def token_digest(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+def canonicalize(value: Any) -> Any:
+    """把请求内容归一成可稳定序列化的形态：键排序、日期统一为 ISO 文本、枚举取其值。
+
+    归一后：JSON 字段顺序不影响结果；date/datetime 与其等价 ISO 字符串表示视为相同内容。
+    """
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        # 整数值浮点与整数表示（5.0 与 5）视为相同内容。
+        return int(value) if value.is_integer() else value
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            return value.astimezone(timezone.utc).isoformat()
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, str):
+        return _normalize_datetime_text(value)
+    if isinstance(value, dict):
+        return {str(key): canonicalize(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [canonicalize(item) for item in value]
+    return value
+
+
+def _normalize_datetime_text(text: str) -> str:
+    """把 ISO 日期/时间字符串归一成与 date/datetime 对象相同的表示；非日期文本原样返回。"""
+    if len(text) == 10:
+        try:
+            return date.fromisoformat(text).isoformat()
+        except ValueError:
+            return text
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    if parsed.tzinfo is not None:
+        return parsed.astimezone(timezone.utc).isoformat()
+    return parsed.isoformat()
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(
+        canonicalize(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+
+
 def request_fingerprint(payload: dict[str, Any]) -> str:
-    compact = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(compact.encode()).hexdigest()
+    return hashlib.sha256(canonical_json(payload).encode()).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
