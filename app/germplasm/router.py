@@ -4,6 +4,7 @@ from datetime import date
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import JSONResponse
 
 from app.api.dependencies import current_principal
 from app.core.security import Principal
@@ -216,17 +217,18 @@ def create_protocol(data: ProtocolCreate, principal: Principal = Depends(current
         return GermplasmService(connection).viability.create_protocol(data.model_dump(mode="json"))
 
 
-@router.post("/tests", status_code=201)
-def schedule_test(data: TestCreate, principal: Principal = Depends(current_principal)) -> dict:
+@router.post("/tests")
+def schedule_test(data: TestCreate, principal: Principal = Depends(current_principal)) -> JSONResponse:
     principal.require("viability.write")
     with transaction(immediate=True) as connection:
-        return GermplasmService(connection).viability.schedule_test(data.model_dump(mode="json"))
+        result = GermplasmService(connection).viability.schedule_test(data.model_dump(mode="json"))
+    return JSONResponse(status_code=200 if result["idempotency"]["replayed"] else 201, content=result)
 
 
 @router.get("/tests/{test_id}")
 def test_detail(test_id: int, principal: Principal = Depends(current_principal)) -> dict:
     principal.require("viability.read")
-    return _service().repository.test_detail(test_id)
+    return _service().viability.test_detail_view(test_id)
 
 
 @router.post("/tests/{test_id}/start")

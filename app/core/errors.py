@@ -21,6 +21,12 @@ class ConflictError(DomainError):
     code = "conflict"
 
 
+class IdempotencyConflictError(ConflictError):
+    """同一幂等键重放了内容不一致的请求。"""
+
+    code = "idempotency_conflict"
+
+
 class AuthenticationError(DomainError):
     status_code = 401
     code = "authentication_failed"

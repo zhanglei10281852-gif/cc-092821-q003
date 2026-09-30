@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import calendar
+import json
 import sqlite3
 from datetime import date, datetime
 from typing import Any
 
+from app.core.canonical import canonicalize
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, ValidationError
 from app.germplasm.inventory import InventoryService
 from app.germplasm.repository import GermplasmRepository, record, records
+from app.services.idempotency import IdempotencyService
+
+SCHEDULE_SCOPE = "viability.schedule"
 
 
 class ViabilityService:
@@ -35,13 +40,15 @@ class ViabilityService:
         return self.repository.require_protocol(int(cursor.lastrowid))
 
     def schedule_test(self, data: dict[str, Any]) -> dict[str, Any]:
-        replay = self.connection.execute(
-            "SELECT response_json FROM idempotency_records WHERE scope='viability.schedule' AND idempotency_key=?",
-            (data["idempotency_key"],),
-        ).fetchone()
-        if replay:
-            import json
-            return self.repository.test_detail(int(json.loads(replay[0])["test_id"]))
+        # 先统一日期表示，再落库与参与指纹比较
+        data = {**data, "scheduled_for": canonicalize(data["scheduled_for"])}
+        idempotency = IdempotencyService(self.connection, self.clock)
+        key = data["idempotency_key"]
+        # 先占用业务键：内容一致的重放返回首次结果，内容不同立即冲突
+        stored = idempotency.claim(SCHEDULE_SCOPE, key, data)
+        if stored is not None:
+            return self._test_view(int(stored.body["test_id"]), replayed=True, idempotency_key=key)
+
         lot = self.repository.require_lot(int(data["lot_id"]))
         protocol = self.repository.require_protocol(int(data["protocol_id"]))
         accession = self.repository.require_accession(int(lot["accession_id"]))
@@ -70,21 +77,60 @@ class ViabilityService:
         except sqlite3.IntegrityError as exc:
             raise ConflictError("检测编号已经存在") from exc
         test_id = int(cursor.lastrowid)
-        import json
+        # 复检日程只允许一次 pending/notified → scheduled 的状态变化
         self.connection.execute(
-            "INSERT INTO idempotency_records(scope,idempotency_key,request_hash,response_json,status_code,created_at) "
-            "VALUES('viability.schedule',?,? ,?,201,?)",
-            (data["idempotency_key"], data["test_no"], json.dumps({"test_id": test_id}), timestamp),
+            "UPDATE retest_schedules SET status='scheduled',updated_at=? "
+            "WHERE id=(SELECT id FROM retest_schedules WHERE lot_id=? AND status IN ('pending','notified') "
+            "ORDER BY due_on LIMIT 1)",
+            (timestamp, lot["id"]),
         )
-        schedule = self.connection.execute(
-            "SELECT id FROM retest_schedules WHERE lot_id=? AND status IN ('pending','notified') ORDER BY due_on LIMIT 1",
-            (lot["id"],),
-        ).fetchone()
-        if schedule:
-            self.connection.execute(
-                "UPDATE retest_schedules SET status='scheduled',updated_at=? WHERE id=?", (timestamp, schedule[0])
-            )
-        return self.repository.test_detail(test_id)
+        # 取样意图：事件键按检测任务去重，重放/并发都只产生一条
+        self.connection.execute(
+            "INSERT OR IGNORE INTO outbox_events(event_key,event_type,aggregate_type,aggregate_id,payload_json,"
+            "available_at,created_at) VALUES(?,?,?,?,?,?,?)",
+            (
+                f"viability-sample-intent-{test_id}", "viability.sample_intended", "viability_test", str(test_id),
+                json.dumps(
+                    {
+                        "test_id": test_id, "test_no": data["test_no"], "lot_id": lot["id"],
+                        "sampled_grams": data["sampled_grams"], "scheduled_for": data["scheduled_for"],
+                        "requested_by": data["requested_by"], "idempotency_key": key,
+                    },
+                    ensure_ascii=False, sort_keys=True,
+                ),
+                timestamp, timestamp,
+            ),
+        )
+        idempotency.finalize(
+            SCHEDULE_SCOPE, key,
+            {"test_id": test_id, "test_no": data["test_no"], "lot_id": lot["id"]}, 201,
+        )
+        return self._test_view(test_id, replayed=False, idempotency_key=key)
+
+    def test_detail_view(self, test_id: int) -> dict[str, Any]:
+        return self._test_view(test_id, replayed=False, idempotency_key=None)
+
+    def _test_view(self, test_id: int, *, replayed: bool, idempotency_key: str | None) -> dict[str, Any]:
+        detail = self.repository.test_detail(test_id)
+        if idempotency_key:
+            record = self.connection.execute(
+                "SELECT idempotency_key,created_at,request_hash FROM idempotency_records WHERE scope=? AND idempotency_key=?",
+                (SCHEDULE_SCOPE, idempotency_key),
+            ).fetchone()
+        else:
+            record = self.connection.execute(
+                "SELECT idempotency_key,created_at,request_hash FROM idempotency_records WHERE scope=? "
+                "AND json_extract(response_json,'$.test_id')=? LIMIT 1",
+                (SCHEDULE_SCOPE, test_id),
+            ).fetchone()
+        detail["idempotency"] = {
+            "replayed": replayed,
+            "idempotency_key": record["idempotency_key"] if record else None,
+            "scope": SCHEDULE_SCOPE,
+            "record_created_at": record["created_at"] if record else None,
+            "request_hash": record["request_hash"] if record else None,
+        }
+        return detail
 
     def start_test(self, test_id: int, data: dict[str, Any]) -> dict[str, Any]:
         test = self.repository.require_test(test_id)
@@ -276,7 +322,6 @@ class ViabilityService:
     def _create_low_viability_alert(self, test_id: int, germination: float, timestamp: str) -> None:
         test = self.repository.require_test(test_id)
         key = f"low-viability-{test_id}"
-        import json
         self.connection.execute(
             "INSERT OR IGNORE INTO quality_alerts(alert_key,alert_type,severity,lot_id,message,detail_json,created_at,updated_at) "
             "VALUES(?,'low_viability','critical',?,?,?,?,?)",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
@@ -7,6 +8,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+from app.core.canonical import canonicalize, request_fingerprint
 from app.core.clock import to_storage, utc_now
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "germplasm.db"
@@ -98,6 +100,7 @@ CREATE TABLE IF NOT EXISTS idempotency_records (
     scope TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
     request_hash TEXT NOT NULL,
+    request_json TEXT,
     response_json TEXT NOT NULL,
     status_code INTEGER NOT NULL,
     created_at TEXT NOT NULL,
@@ -468,10 +471,61 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         raise
 
 
+def _migrate_idempotency_records(connection: sqlite3.Connection) -> None:
+    """为旧版幂等记录补存规范化请求体并重算指纹，保证重启前后语义一致。"""
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(idempotency_records)").fetchall()}
+    if "request_json" not in columns:
+        connection.execute("ALTER TABLE idempotency_records ADD COLUMN request_json TEXT")
+    rows = connection.execute(
+        "SELECT scope,idempotency_key,request_hash,request_json,response_json FROM idempotency_records "
+        "WHERE request_json IS NULL OR request_json=''"
+    ).fetchall()
+    for row in rows:
+        request = _reconstruct_legacy_request(connection, row)
+        if request is None:
+            continue
+        canonical = canonicalize(request)
+        connection.execute(
+            "UPDATE idempotency_records SET request_hash=?,request_json=? WHERE scope=? AND idempotency_key=?",
+            (
+                request_fingerprint(canonical),
+                json.dumps(canonical, ensure_ascii=False, sort_keys=True),
+                row["scope"], row["idempotency_key"],
+            ),
+        )
+
+
+def _reconstruct_legacy_request(connection: sqlite3.Connection, row: sqlite3.Row) -> dict | None:
+    """旧版 viability.schedule 记录把 test_no 误存为指纹，可从检测任务还原原始请求。"""
+    if row["scope"] != "viability.schedule":
+        return None
+    try:
+        test_id = int(json.loads(row["response_json"]).get("test_id", 0))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    test = connection.execute(
+        "SELECT test_no,lot_id,protocol_id,test_type,sampled_grams,scheduled_for,requested_by "
+        "FROM viability_tests WHERE id=?", (test_id,)
+    ).fetchone()
+    if test is None:
+        return None
+    return {
+        "test_no": test["test_no"],
+        "lot_id": test["lot_id"],
+        "protocol_id": test["protocol_id"],
+        "test_type": test["test_type"],
+        "sampled_grams": test["sampled_grams"],
+        "scheduled_for": test["scheduled_for"],
+        "requested_by": test["requested_by"],
+        "idempotency_key": row["idempotency_key"],
+    }
+
+
 def init_db() -> None:
     timestamp = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _migrate_idempotency_records(connection)
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",

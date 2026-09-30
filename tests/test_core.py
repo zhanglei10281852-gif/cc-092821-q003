@@ -4,9 +4,10 @@ from datetime import UTC, datetime
 
 import pytest
 
+from app.core.canonical import request_fingerprint
 from app.core.clock import FrozenClock, from_storage, to_storage
 from app.core.errors import ValidationError
-from app.core.security import hash_password, normalize_username, request_fingerprint, verify_password
+from app.core.security import hash_password, normalize_username, verify_password
 from app.services.jobs import JobService
 
 

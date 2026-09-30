@@ -3,10 +3,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-import json
 import secrets
 from dataclasses import dataclass
-from typing import Any
 
 from app.core.errors import ValidationError
 
@@ -67,11 +65,6 @@ def generate_token() -> str:
 
 def token_digest(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
-
-
-def request_fingerprint(payload: dict[str, Any]) -> str:
-    compact = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(compact.encode()).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
